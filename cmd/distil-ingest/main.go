@@ -134,6 +134,11 @@ func main() {
 			Value: 1000,
 			Usage: "The bulk batch size for database ingest",
 		},
+		cli.IntFlag{
+			Name:  "db-thread-count",
+			Value: 1,
+			Usage: "The number of threads to use for batch insert.",
+		},
 		cli.Int64Flag{
 			Name:  "batch-size",
 			Value: 1024 * 1024 * 20,
@@ -228,6 +233,7 @@ func main() {
 			DBUser:               c.String("db-user"),
 			DBPassword:           c.String("db-password"),
 			DBBatchSize:          c.Int("db-batch-size"),
+			DBThreadCount:        c.Int("db-thread-count"),
 			DBHost:               c.String("db-host"),
 			DBPort:               c.Int("db-port"),
 		}
@@ -460,6 +466,13 @@ func ingestPostgres(config *conf.Conf, meta *model.Metadata) error {
 	err = pg.InsertRemainingRows()
 	if err != nil {
 		log.Warn(fmt.Sprintf("%v", err))
+	}
+
+	errs := pg.CompleteRun()
+	if len(errs) > 0 {
+		for _, err := range errs {
+			log.Warn(fmt.Sprintf("%v", err))
+		}
 	}
 
 	log.Info("Done ingestion")

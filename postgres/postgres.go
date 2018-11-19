@@ -99,9 +99,18 @@ var (
 
 // Database is a struct representing a full logical database.
 type Database struct {
-	DB        *pg.DB
-	Tables    map[string]*model.Dataset
-	BatchSize int
+	DB            *pg.DB
+	Tables        map[string]*model.Dataset
+	batchSize     int
+	threadCount   int
+	batchChannel  chan *batch
+	errorChannels []chan error
+}
+
+type batch struct {
+	inserts      *model.InsertBatch
+	tableName    string
+	errorChannel chan error
 }
 
 // WordStem contains the pairing of a word and its stemmed version.
@@ -120,12 +129,18 @@ func NewDatabase(config *conf.Conf) (*Database, error) {
 	})
 
 	database := &Database{
-		DB:        db,
-		Tables:    make(map[string]*model.Dataset),
-		BatchSize: config.DBBatchSize,
+		DB:           db,
+		Tables:       make(map[string]*model.Dataset),
+		batchSize:    config.DBBatchSize,
+		threadCount:  config.DBThreadCount,
+		batchChannel: make(chan *batch),
 	}
 
 	database.Tables[wordStemTableName] = model.NewDataset(wordStemTableName, wordStemTableName, "", nil)
+
+	for i := 0; i < config.DBThreadCount; i++ {
+		go database.runBatchIngest(database.batchChannel)
+	}
 
 	return database, nil
 }
@@ -179,20 +194,38 @@ func (d *Database) CreateSolutionMetadataTables() error {
 	return nil
 }
 
-func (d *Database) executeInserts(tableName string) error {
+func (d *Database) submitBatch(tableName string) {
+	errorChannel := make(chan error, 1)
+	d.errorChannels = append(d.errorChannels, errorChannel)
+
 	ds := d.Tables[tableName]
+	batch := &batch{
+		inserts:      ds.GetBatch(),
+		tableName:    tableName,
+		errorChannel: errorChannel,
+	}
 
-	insertStatement := fmt.Sprintf("INSERT INTO %s.%s.%s_base VALUES %s;", "distil", "public", tableName, strings.Join(ds.GetBatch(), ", "))
+	d.batchChannel <- batch
+}
 
-	_, err := d.DB.Exec(insertStatement, ds.GetBatchArgs()...)
+func (d *Database) runBatchIngest(input chan *batch) {
+	for batch := range input {
+		batch.errorChannel <- d.executeInserts(batch.tableName, batch.inserts)
+	}
+}
+
+func (d *Database) executeInserts(tableName string, batch *model.InsertBatch) error {
+	insertStatement := fmt.Sprintf("INSERT INTO %s.%s.%s_base VALUES %s;", "distil", "public", tableName, strings.Join(batch.GetInsertBatch(), ", "))
+	_, err := d.DB.Exec(insertStatement, batch.GetInsertArgs()...)
 
 	return err
 }
 
 func (d *Database) executeInsertsComplete(tableName string) error {
 	ds := d.Tables[tableName]
+	batch := ds.GetBatch()
 
-	_, err := d.DB.Exec(strings.Join(ds.GetBatch(), " "), ds.GetBatchArgs()...)
+	_, err := d.DB.Exec(strings.Join(batch.GetInsertBatch(), " "), batch.GetInsertArgs()...)
 
 	return err
 }
@@ -290,12 +323,8 @@ func (d *Database) IngestRow(tableName string, data string) error {
 	insertStatement = fmt.Sprintf("(%s)", insertStatement[2:])
 	ds.AddInsert(insertStatement, values)
 
-	if ds.GetBatchSize() >= d.BatchSize {
-		err := d.executeInserts(tableName)
-		if err != nil {
-			return errors.Wrap(err, "unable to insert to table "+tableName)
-		}
-
+	if ds.GetBatchSize() >= d.batchSize {
+		d.submitBatch(tableName)
 		ds.ResetBatch()
 	}
 
@@ -307,7 +336,8 @@ func (d *Database) InsertRemainingRows() error {
 	for tableName, ds := range d.Tables {
 		if ds.GetBatchSize() > 0 {
 			if tableName != wordStemTableName {
-				err := d.executeInserts(tableName)
+				batch := ds.GetBatch()
+				err := d.executeInserts(tableName, batch)
 				if err != nil {
 					return errors.Wrap(err, "unable to insert remaining rows for table "+tableName)
 				}
@@ -321,6 +351,22 @@ func (d *Database) InsertRemainingRows() error {
 	}
 
 	return nil
+}
+
+// Complete run collates all the errors from the batches inserted and
+// closes the channels.
+func (d *Database) CompleteRun() []error {
+	// Collect all the errors and close all the channels.
+	errors := make([]error, 0)
+	for _, errChannel := range d.errorChannels {
+		err := <-errChannel
+		if err != nil {
+			errors = append(errors, err)
+		}
+		close(errChannel)
+	}
+
+	return errors
 }
 
 // AddWordStems builds the word stemming lookup in the database.
@@ -343,7 +389,7 @@ func (d *Database) AddWordStems(data string) error {
 			// query for the stemmed version of each word.
 			query := fmt.Sprintf("INSERT INTO %s VALUES (unnest(tsvector_to_array(to_tsvector(?))), ?) ON CONFLICT (stem) DO NOTHING;", wordStemTableName)
 			ds.AddInsert(query, []interface{}{fieldValue, strings.ToLower(fieldValue)})
-			if ds.GetBatchSize() >= d.BatchSize {
+			if ds.GetBatchSize() >= d.batchSize {
 				err := d.executeInsertsComplete(wordStemTableName)
 				if err != nil {
 					return errors.Wrap(err, "unable to insert to table "+wordStemTableName)
