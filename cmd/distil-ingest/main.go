@@ -1,8 +1,9 @@
 package main
 
 import (
-	"bufio"
+	"encoding/csv"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -135,9 +136,14 @@ func main() {
 			Usage: "The bulk batch size for database ingest",
 		},
 		cli.IntFlag{
-			Name:  "db-thread-count",
+			Name:  "db-thread-count-pg",
 			Value: 1,
 			Usage: "The number of threads to use for batch insert.",
+		},
+		cli.IntFlag{
+			Name:  "db-thread-count-go",
+			Value: 1,
+			Usage: "The number of threads to use for processing records.",
 		},
 		cli.Int64Flag{
 			Name:  "batch-size",
@@ -233,7 +239,8 @@ func main() {
 			DBUser:               c.String("db-user"),
 			DBPassword:           c.String("db-password"),
 			DBBatchSize:          c.Int("db-batch-size"),
-			DBThreadCount:        c.Int("db-thread-count"),
+			DBThreadCountPG:      c.Int("db-thread-count-pg"),
+			DBThreadCountGo:      c.Int("db-thread-count-go"),
 			DBHost:               c.String("db-host"),
 			DBPort:               c.Int("db-port"),
 		}
@@ -440,27 +447,28 @@ func ingestPostgres(config *conf.Conf, meta *model.Metadata) error {
 	log.Infof("Done creating result table")
 
 	// Load the data.
-	reader, err := os.Open(config.DatasetPath)
-	scanner := bufio.NewScanner(reader)
+	csvFile, err := os.Open(config.DatasetPath)
+	if err != nil {
+		return err
+	}
+
+	csvReader := csv.NewReader(csvFile)
 
 	// skip header
-	scanner.Scan()
-	count := 0
-	for scanner.Scan() {
-		line := scanner.Text()
-		// Raw schema source will have header row.
-		if count > 0 || meta.SchemaSource != model.SchemaSourceRaw {
-			err = pg.AddWordStems(line)
-			if err != nil {
-				log.Warn(fmt.Sprintf("%v", err))
-			}
-
-			err = pg.IngestRow(dbTableName, line)
-			if err != nil {
-				log.Warn(fmt.Sprintf("%v", err))
-			}
+	csvReader.Read()
+	for {
+		line, err := csvReader.Read()
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			return err
 		}
-		count = count + 1
+		err = pg.AddWordStems(line)
+		if err != nil {
+			log.Warn(fmt.Sprintf("%v", err))
+		}
+
+		pg.SubmitRecord(dbTableName, line)
 	}
 
 	err = pg.InsertRemainingRows()

@@ -32,14 +32,15 @@ type Conf struct {
 	ProbabilityThreshold float64
 
 	// postgres config
-	Database      string
-	DBTable       string
-	DBUser        string
-	DBPassword    string
-	DBBatchSize   int
-	DBHost        string
-	DBPort        int
-	DBThreadCount int
+	Database        string
+	DBTable         string
+	DBUser          string
+	DBPassword      string
+	DBBatchSize     int
+	DBHost          string
+	DBPort          int
+	DBThreadCountPG int
+	DBThreadCountGo int
 
 	// control flags
 	IncludeRaw   bool

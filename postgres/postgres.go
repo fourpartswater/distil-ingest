@@ -8,7 +8,6 @@ import (
 	"github.com/go-pg/pg"
 	"github.com/pkg/errors"
 
-	"github.com/unchartedsoftware/deluge/document"
 	api "github.com/unchartedsoftware/distil-compute/model"
 	"github.com/unchartedsoftware/distil-ingest/conf"
 	"github.com/unchartedsoftware/distil-ingest/postgres/model"
@@ -99,12 +98,27 @@ var (
 
 // Database is a struct representing a full logical database.
 type Database struct {
-	DB            *pg.DB
-	Tables        map[string]*model.Dataset
-	batchSize     int
-	threadCount   int
-	batchChannel  chan *batch
-	errorChannels []chan error
+	DB                  *pg.DB
+	Tables              map[string]*model.Dataset
+	batchSize           int
+	threadCountPG       int
+	threadCountGo       int
+	batchChannel        chan *batch
+	recordChannel       chan *record
+	parsedRecordChannel chan *parsedRecord
+	errorChannels       []chan error
+}
+
+type record struct {
+	tableName string
+	data      []string
+}
+
+type parsedRecord struct {
+	tableName string
+	insert    string
+	args      []interface{}
+	err       error
 }
 
 type batch struct {
@@ -129,18 +143,27 @@ func NewDatabase(config *conf.Conf) (*Database, error) {
 	})
 
 	database := &Database{
-		DB:           db,
-		Tables:       make(map[string]*model.Dataset),
-		batchSize:    config.DBBatchSize,
-		threadCount:  config.DBThreadCount,
-		batchChannel: make(chan *batch),
+		DB:                  db,
+		Tables:              make(map[string]*model.Dataset),
+		batchSize:           config.DBBatchSize,
+		threadCountPG:       config.DBThreadCountPG,
+		threadCountGo:       config.DBThreadCountGo,
+		batchChannel:        make(chan *batch, 10),
+		recordChannel:       make(chan *record, 10000),
+		parsedRecordChannel: make(chan *parsedRecord, 10000),
 	}
 
 	database.Tables[wordStemTableName] = model.NewDataset(wordStemTableName, wordStemTableName, "", nil)
 
-	for i := 0; i < config.DBThreadCount; i++ {
+	for i := 0; i < config.DBThreadCountPG; i++ {
 		go database.runBatchIngest(database.batchChannel)
 	}
+
+	for i := 0; i < config.DBThreadCountGo; i++ {
+		go database.runRecordIngest(database.recordChannel, database.parsedRecordChannel)
+	}
+
+	go database.runBatchBuilder(database.parsedRecordChannel)
 
 	return database, nil
 }
@@ -194,6 +217,15 @@ func (d *Database) CreateSolutionMetadataTables() error {
 	return nil
 }
 
+func (d *Database) SubmitRecord(tableName string, data []string) {
+	record := &record{
+		tableName: tableName,
+		data:      data,
+	}
+
+	d.recordChannel <- record
+}
+
 func (d *Database) submitBatch(tableName string) {
 	errorChannel := make(chan error, 1)
 	d.errorChannels = append(d.errorChannels, errorChannel)
@@ -211,6 +243,25 @@ func (d *Database) submitBatch(tableName string) {
 func (d *Database) runBatchIngest(input chan *batch) {
 	for batch := range input {
 		batch.errorChannel <- d.executeInserts(batch.tableName, batch.inserts)
+	}
+}
+
+func (d *Database) runBatchBuilder(input chan *parsedRecord) {
+	for parsedRecord := range input {
+		ds := d.Tables[parsedRecord.tableName]
+		ds.AddInsert(parsedRecord.insert, parsedRecord.args)
+
+		if ds.GetBatchSize() >= d.batchSize {
+			d.submitBatch(parsedRecord.tableName)
+			ds.ResetBatch()
+		}
+	}
+}
+
+func (d *Database) runRecordIngest(input chan *record, output chan *parsedRecord) {
+	for record := range input {
+		//TODO: Handle potential errors from ingest row call.
+		output <- d.IngestRow(record.tableName, record.data)
 	}
 }
 
@@ -294,41 +345,33 @@ func (d *Database) DeleteDataset(name string) {
 
 // IngestRow parses the raw csv data and stores it to the table specified.
 // The previously parsed metadata is used to map columns.
-func (d *Database) IngestRow(tableName string, data string) error {
+func (d *Database) IngestRow(tableName string, data []string) *parsedRecord {
 	ds := d.Tables[tableName]
 
 	insertStatement := ""
 	variables := ds.Variables
 	values := make([]interface{}, len(variables))
-	doc := &document.CSV{}
-	doc.SetData(data)
 
-	// If a row ends in a delimeter, deluge does not add the last field.
-	if len(doc.Cols) == len(variables)-1 && strings.HasSuffix(data, ",") {
-		doc.Cols = append(doc.Cols, "")
-	}
 	for i := 0; i < len(variables); i++ {
 		// Default columns that have an empty column.
 		var val interface{}
-		if d.isNullVariable(variables[i].Type, doc.Cols[i]) {
+		if d.isNullVariable(variables[i].Type, data[i]) {
 			val = nil
 		} else if d.isArray(variables[i].Type) {
-			val = fmt.Sprintf("{%s}", doc.Cols[i])
+			val = fmt.Sprintf("{%s}", data[i])
 		} else {
-			val = doc.Cols[i]
+			val = data[i]
 		}
 		insertStatement = fmt.Sprintf("%s, ?", insertStatement)
 		values[i] = val
 	}
 	insertStatement = fmt.Sprintf("(%s)", insertStatement[2:])
-	ds.AddInsert(insertStatement, values)
 
-	if ds.GetBatchSize() >= d.batchSize {
-		d.submitBatch(tableName)
-		ds.ResetBatch()
+	return &parsedRecord{
+		args:      values,
+		insert:    insertStatement,
+		tableName: tableName,
 	}
-
-	return nil
 }
 
 // InsertRemainingRows empties all batches and inserts the data to the database.
@@ -370,16 +413,12 @@ func (d *Database) CompleteRun() []error {
 }
 
 // AddWordStems builds the word stemming lookup in the database.
-func (d *Database) AddWordStems(data string) error {
+func (d *Database) AddWordStems(data []string) error {
 	ds := d.Tables[wordStemTableName]
 
-	// process every field (assume csv).
-	doc := &document.CSV{}
-	doc.SetData(data)
-
-	for i := 0; i < len(doc.Cols); i++ {
+	for _, field := range data {
 		// split the field into tokens.
-		fields := strings.Fields(doc.Cols[i])
+		fields := strings.Fields(field)
 		for _, f := range fields {
 			fieldValue := wordRegex.ReplaceAllString(f, "")
 			if fieldValue == "" {
